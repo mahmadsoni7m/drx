@@ -1,0 +1,198 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  GODOT_VERSION: "4.3"
+  EXPORT_PRESET: "Android Debug"
+  APK_PATH: "build/DRIVE-X-debug.apk"
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    container:
+      image: barichello/godot-ci:4.3
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Environment report
+        run: |
+          mkdir -p logs build
+          {
+            echo "godot: $(godot --version 2>&1 | tail -n1)"
+            echo "java: $(java -version 2>&1 | head -n1)"
+            echo "ANDROID_HOME=${ANDROID_HOME:-unset} ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-unset}"
+            echo "HOME=$HOME"
+          } | tee logs/environment.log
+
+      - name: Validate repository layout
+        run: bash tools/validate_repo.sh 2>&1 | tee logs/validate_repo.log; test "${PIPESTATUS[0]}" -eq 0
+
+      - name: Install export templates for this user
+        run: |
+          SRC="/root/.local/share/godot/export_templates/${GODOT_VERSION}.stable"
+          DST="$HOME/.local/share/godot/export_templates/${GODOT_VERSION}.stable"
+          mkdir -p "$(dirname "$DST")"
+          if [ -d "$SRC" ] && [ "$SRC" != "$DST" ] && [ ! -d "$DST" ]; then cp -r "$SRC" "$DST"; fi
+          if [ ! -f "$DST/android_debug.apk" ]; then
+            echo "::error::Android export templates not found at $DST"; ls -la "$DST" || true; exit 1
+          fi
+          ls "$DST" | head -n 30
+
+      - name: Configure Android SDK, JDK and debug keystore
+        run: |
+          SDK=""
+          for c in "${ANDROID_HOME:-}" "${ANDROID_SDK_ROOT:-}" /usr/lib/android-sdk /usr/local/lib/android/sdk /opt/android-sdk /root/android-sdk; do
+            if [ -n "$c" ] && [ -d "$c" ]; then SDK="$c"; break; fi
+          done
+          if [ -z "$SDK" ]; then echo "::error::Android SDK directory not found in container"; exit 1; fi
+          echo "Android SDK: $SDK"
+          JAVA_BIN="$(command -v javac || true)"
+          if [ -z "$JAVA_BIN" ]; then echo "::error::JDK (javac) not found"; exit 1; fi
+          JDK="$(dirname "$(dirname "$(readlink -f "$JAVA_BIN")")")"
+          echo "JDK: $JDK"
+          # Best effort: make sure the components Godot 4.3 checks for are present.
+          SDKM="$(command -v sdkmanager || ls "$SDK"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | head -n1 || true)"
+          if [ -n "$SDKM" ]; then
+            yes | "$SDKM" --sdk_root="$SDK" --licenses >/dev/null 2>&1 || true
+            "$SDKM" --sdk_root="$SDK" "platform-tools" "build-tools;34.0.0" "platforms;android-34" 2>&1 | tail -n 5 || true
+          else
+            echo "::warning::sdkmanager not found; relying on preinstalled SDK components"
+          fi
+          KS="$HOME/debug.keystore"
+          if [ ! -f "$KS" ]; then
+            keytool -keyalg RSA -genkeypair -alias androiddebugkey -keypass android -keystore "$KS" \
+              -storepass android -dname "CN=Android Debug,O=Android,C=US" -validity 9999 -deststoretype pkcs12
+          fi
+          mkdir -p "$HOME/.config/godot"
+          for f in editor_settings-4.tres editor_settings-4.3.tres; do
+            cat > "$HOME/.config/godot/$f" <<SETTINGS
+          [gd_resource type="EditorSettings" format=3]
+
+          [resource]
+          export/android/android_sdk_path = "$SDK"
+          export/android/java_sdk_path = "$JDK"
+          export/android/debug_keystore = "$KS"
+          export/android/debug_keystore_user = "androiddebugkey"
+          export/android/debug_keystore_pass = "android"
+          SETTINGS
+          done
+          # Godot 4.3 also reads these environment variables for debug signing.
+          {
+            echo "GODOT_ANDROID_KEYSTORE_DEBUG_PATH=$KS"
+            echo "GODOT_ANDROID_KEYSTORE_DEBUG_USER=androiddebugkey"
+            echo "GODOT_ANDROID_KEYSTORE_DEBUG_PASSWORD=android"
+            echo "ANDROID_HOME=$SDK"
+            echo "ANDROID_SDK_ROOT=$SDK"
+          } >> "$GITHUB_ENV"
+
+      - name: Import project (build class cache)
+        run: |
+          godot --headless --path . --import 2>&1 | tee logs/import.log || true
+          godot --headless --path . --import 2>&1 | tee -a logs/import.log || true
+          if grep -E "SCRIPT ERROR|Parse Error" logs/import.log; then
+            echo "::error::GDScript errors found during import"; exit 1
+          fi
+
+      - name: Self-test (content, Tajik text, models, world, physics, combat)
+        run: |
+          godot --headless --path . --script res://tools/self_test.gd 2>&1 | tee logs/self_test.log
+          test "${PIPESTATUS[0]}" -eq 0
+          grep -q "SELFTEST OK" logs/self_test.log
+          if grep -E "SCRIPT ERROR|Parse Error" logs/self_test.log; then
+            echo "::error::GDScript errors during self-test"; exit 1
+          fi
+
+      - name: Smoke test - menu scene runs
+        run: |
+          timeout 180 godot --headless --path . --scene res://scenes/Main.tscn --quit-after 120 2>&1 | tee logs/smoke_menu.log || true
+          if grep -E "SCRIPT ERROR|Parse Error" logs/smoke_menu.log; then
+            echo "::error::Runtime script errors in the menu scene"; exit 1
+          fi
+
+      - name: Smoke test - open world runs
+        run: |
+          timeout 300 godot --headless --path . --scene res://scenes/Game.tscn --quit-after 240 2>&1 | tee logs/smoke_world.log || true
+          if grep -E "SCRIPT ERROR|Parse Error" logs/smoke_world.log; then
+            echo "::error::Runtime script errors in the open world"; exit 1
+          fi
+
+      - name: Export APK
+        run: |
+          rm -f "$APK_PATH"
+          godot --headless --verbose --path . --export-debug "$EXPORT_PRESET" "$APK_PATH" 2>&1 | tee logs/export.log || true
+          if grep -E "Cannot export project|ERROR: .*export" logs/export.log; then
+            echo "::error::Godot reported an export error (see logs/export.log)"; exit 1
+          fi
+
+      - name: Verify APK and that JSON content is packed
+        run: |
+          if [ ! -s "$APK_PATH" ]; then echo "::error::APK was not produced"; exit 1; fi
+          SIZE=$(stat -c %s "$APK_PATH")
+          echo "APK size: $SIZE bytes"
+          if [ "$SIZE" -lt 5000000 ]; then echo "::error::APK suspiciously small"; exit 1; fi
+          unzip -tq "$APK_PATH"
+          unzip -l "$APK_PATH" | grep -q "AndroidManifest.xml"
+          unzip -l "$APK_PATH" | grep -q "classes.dex"
+          godot --headless --path . --export-pack "$EXPORT_PRESET" build/content-check.pck 2>&1 | tee logs/export_pack.log || true
+          for f in content/index.json content/cars/gt_rookie.json content/locale/tg.json content/races/ring_highway.json; do
+            if ! grep -aq "$f" build/content-check.pck; then echo "::error::$f is missing from the exported package"; exit 1; fi
+          done
+          rm -f build/content-check.pck
+          sha256sum "$APK_PATH" | tee logs/apk.sha256
+
+      - name: Upload APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: DRIVE-X-debug-apk
+          path: build/DRIVE-X-debug.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Show Godot logs
+        if: always()
+        run: |
+          NOISE='Parameter "m" is null|mesh_get_surface_count|leaked at exit|ObjectDB|cleanup \(core|PagedAllocator|paged_allocator'
+          {
+            echo "## Godot logs"
+            for f in logs/import.log logs/self_test.log logs/smoke_menu.log logs/smoke_world.log logs/export.log; do
+              [ -f "$f" ] || continue
+              echo "### $f"
+              echo '```'
+              grep -E "SCRIPT ERROR|Parse Error|FAIL|SELFTEST|content problem|missing Tajik|ERROR:|WARNING:" "$f" | grep -Ev "$NOISE" | head -n 60 || true
+              echo '```'
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+          for f in logs/*.log; do
+            [ -f "$f" ] || continue
+            echo "::group::$f (errors only, last 60)"
+            grep -E "SCRIPT ERROR|Parse Error|FAIL|SELFTEST|content problem|missing Tajik|ERROR:" "$f" | grep -Ev "$NOISE" | tail -n 60 || true
+            echo "::endgroup::"
+          done
+          grep -hE "SCRIPT ERROR|Parse Error|FAIL " logs/*.log 2>/dev/null | grep -Ev "$NOISE" | head -n 10 | while read -r line; do echo "::error::$line"; done || true
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: DRIVE-X-build-logs
+          path: logs/
+          if-no-files-found: warn
+          retention-days: 14
